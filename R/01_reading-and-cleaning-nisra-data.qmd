@@ -1,0 +1,267 @@
+---
+title: "Reading Data from NISRA table builder"
+author: "Dave"
+format: html
+editor: visual
+---
+
+## Housekeeping
+
+### Libraries
+
+```{r libraries}
+library(sf)
+library(here)
+
+library(vroom)
+library(stringr)
+library(dplyr)
+library(janitor)
+library(forcats)
+library(tidyr)
+```
+
+## Read data
+
+### Build table reader function
+
+URLs look something like this:
+
+> https://build.nisra.gov.uk/en/custom/table.csv?d=PEOPLE&v=DZ21&v=HEALTH_IN_GENERAL
+
+```{r buildFunction}
+read_nisra <- function(topic, level = "PEOPLE",
+                       geography = "DZ21", ...){
+  
+  url <- "https://build.nisra.gov.uk/en/custom/table.csv"
+  
+  queries <-
+    c(str_c("d=", level),
+      str_c("v=", geography),
+      str_c("v=", topic))
+  
+  queries <- str_c(queries, collapse = "&")
+  
+  vroom_url <- str_c(url, queries, sep = "?")
+  
+  out <- vroom(vroom_url, ..., col_types = "ccncn")
+  
+  return(out)
+}
+```
+
+```{r cleanNisra}
+clean_nisra <- function(x){
+  
+  select(x, -2, -3) |> 
+    rename(dz_2021_code = "Census 2021 Data Zone Code") |> 
+    clean_names()
+}
+```
+
+```{r getNisra}
+get_nisra <- function(...) clean_nisra(read_nisra(...))
+
+```
+
+### Use table reader
+
+```{r useTableReader}
+
+general_health       <- get_nisra("HEALTH_IN_GENERAL")
+ethnicity            <- get_nisra("ETHNIC_GROUP_INTERMEDIATE")
+ethnicity_harmonised <- get_nisra("ETHNIC_GROUP_AGG5")
+religion             <- get_nisra("RELIGION_BELONG_TO_DVO")
+age_single_year      <- get_nisra("AGE_SYOA_85")
+hours_worked         <- get_nisra("HOURS_WORKED_AGG5")
+
+household_deprivation <- get_nisra("HH_DEPRIVATION", level = "HOUSEHOLD")
+household_composition <- get_nisra("HH_FAMILY_COMPOSITION_AGG9",
+                                   level = "HOUSEHOLD")
+```
+
+### Rename labels
+
+```{r rename_labels}
+
+rename_label <- function(x, new_name = NULL){
+    
+    var_name <- enexpr(x)
+    
+    if(!is.null(new_name)) out <- rename(x, !!new_name := 2)
+    else out <- rename(x, !!var_name := 2)
+    
+    return(out)
+}
+```
+
+```{r renameThem}
+general_health       <- rename_label(general_health)
+ethnicity            <- rename_label(ethnicity)
+ethnicity_harmonised <- rename_label(ethnicity_harmonised, "ethnicity")
+religion             <- rename_label(religion)
+age_single_year      <- rename_label(age_single_year, "age")
+hours_worked         <- rename_label(hours_worked)
+
+household_composition <-
+  rename_label(household_composition, "household_composition")
+household_deprivation <-
+  rename_label(household_deprivation, "n_dimensions_deprivation")
+```
+
+### Other tweaks
+
+```{r miscTweaks}
+general_health <- 
+  mutate(general_health,
+         general_health = 
+           str_remove(general_health, " health") |>
+           str_to_lower() |> 
+           ordered(levels = c("very bad", "bad", "fair", "good", "very good")))
+
+ethnicity <- 
+  mutate(ethnicity,
+         ethnicity =
+           str_to_lower(ethnicity) |> 
+           ordered() |> 
+           fct_reorder(count))
+
+ethnicity_harmonised <- 
+  mutate(ethnicity_harmonised,
+         ethnicity =
+           str_to_lower(ethnicity) |> 
+           ordered() |> 
+           fct_reorder(count))
+
+age_single_year <- 
+  mutate(age_single_year,
+         age = ordered(age) |> 
+           fct_inorder())
+
+age_five_year <- 
+  age_single_year |> 
+  group_by(dz_2021_code) |> 
+  mutate(
+    row = row_number(),
+    five_year_group = ceiling(row/5)) |> 
+  group_by(five_year_group) |> 
+  mutate(upper = str_extract(first(age), "\\d+"),
+         lower = str_extract(last(age), "\\d+")) |>
+  mutate(label = str_c(upper, lower, "years", sep = "_")) |> 
+  group_by(dz_2021_code, label) |> 
+  summarise(count = sum(count), .groups = "drop") |> 
+  rename(age = label) |> 
+  mutate(age = replace(age, age == "85_85_years", "85_plus_years"))
+
+hours_worked <- 
+  mutate(hours_worked,
+         hours_worked = 
+           str_remove(hours_worked,
+                      "(?<=^).+-time:[:space:]+(?=\\d)") |> 
+           ordered() |> 
+           fct_inorder() |>
+           fct_recode("not applicable" = "No code required"))
+
+household_deprivation <-
+  household_deprivation |> 
+  mutate(
+    n_dimensions_deprivation =
+      str_remove(n_dimensions_deprivation, "Household is "),
+    n_dimensions_deprivation = 
+      case_match(
+        n_dimensions_deprivation,
+        "not deprived in any dimension" ~ "deprived in 0 dimensions",
+        .default = n_dimensions_deprivation)
+  )
+```
+
+### Count to persons/households
+
+```{r countToHousholds}
+household_composition <- rename(household_composition, households = count)
+household_deprivation <- rename(household_deprivation, households = count)
+```
+
+```{r countToPersons}
+count_to_persons <- function(x) rename(x, persons = count)
+
+general_health       <- count_to_persons(general_health)
+ethnicity            <- count_to_persons(ethnicity)
+ethnicity_harmonised <- count_to_persons(ethnicity_harmonised)
+religion             <- count_to_persons(religion)
+age_single_year      <- count_to_persons(age_single_year)
+age_five_year        <- count_to_persons(age_five_year)
+hours_worked         <- count_to_persons(hours_worked)
+```
+
+### Pivot wider
+
+```{r widenNisra}
+widen_nisra <- function(x){
+  pivot_wider(x, names_from = 2, values_from = 3) |> 
+    clean_names()
+}
+```
+
+```{r widenThem}
+general_health        <- widen_nisra(general_health)
+ethnicity             <- widen_nisra(ethnicity)
+ethnicity_harmonised  <- widen_nisra(ethnicity_harmonised)
+religion              <- widen_nisra(religion)
+age_single_year       <- widen_nisra(age_single_year)
+age_five_year         <- widen_nisra(age_five_year)
+hours_worked          <- widen_nisra(hours_worked)
+household_composition <- widen_nisra(household_composition)
+household_deprivation <- widen_nisra(household_deprivation)
+```
+
+### Fix column names
+
+```{r rename}
+age_single_year <-
+  rename_with(age_single_year, str_replace,
+              starts_with("x"), "x", "age_")
+
+age_five_year <-
+  rename_with(age_five_year, str_replace,
+              starts_with("x"), "x", "age_")
+
+hours_worked <- 
+  rename_with(hours_worked, 
+              \(x){
+                str_remove(x, "hours_") |> 
+                  str_replace("(?<=^)x", "hours_")
+              })
+```
+
+## Save data
+
+```{r saveNisra}
+save_dir <- here("census-data_northern-ireland")
+
+save_nisra <- function(x, file_name){
+  
+  save_name <-
+    str_c("northern-ireland", file_name, "dz", "2021", sep = "_")
+  
+  save_name <- here(save_dir, save_name)
+  
+  csv_name <- str_c(save_name, ".csv")
+  rds_name <- str_c(save_name, ".RDS")
+  
+  vroom_write(x, csv_name, delim = ",")
+  saveRDS(x, rds_name)
+  }
+```
+
+```{r saveThem}
+save_nisra(general_health, "general-health")
+save_nisra(ethnicity, "ethnicity")
+save_nisra(ethnicity_harmonised, "ethnicity-harmonised")
+save_nisra(religion, "religion")
+save_nisra(age_single_year, "age-single-year")
+save_nisra(age_five_year, "age-five-year")
+save_nisra(hours_worked, "hours-worked")
+save_nisra(household_composition, "household-composition")
+save_nisra(household_deprivation, "household-deprivation")
+```
